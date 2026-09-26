@@ -23,6 +23,8 @@ STATIC_DIR = Path(__file__).parent / "static"
 
 TIME_RE = re.compile(r"^\s*(\d{1,3}):([0-5]?\d):([0-5]?\d)[,.](\d{1,3})\s*$")
 ARROW_RE = re.compile(r"-->")
+BLOCK_SEP_RE = re.compile(r"\n[ \t]*\n")  # 字幕块之间的空行分隔（与 parse_srt 共用）
+EDGE_STRIP_CHARS = "\n﻿ "  # parse_srt 解析前从全文首尾剔除的字符（\n、BOM、空格）
 
 
 # ---------------------------------------------------------------- 时间工具
@@ -51,11 +53,11 @@ def fmt_time(ms: int) -> str:
 
 def parse_srt(text: str) -> List[dict]:
     """解析 SRT，保留序号与正文。返回 [{index, start, end, lines}]。"""
-    text = text.replace("\r\n", "\n").replace("\r", "\n").strip("\n﻿ ")
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip(EDGE_STRIP_CHARS)
     if not text:
         raise ValueError("SRT 内容为空")
     entries = []
-    for block in re.split(r"\n[ \t]*\n", text):
+    for block in BLOCK_SEP_RE.split(text):
         lines = [ln for ln in block.strip("\n").split("\n") if ln.strip() != ""]
         if not lines:
             continue
@@ -2978,6 +2980,69 @@ def _apply_term_hits(text: str, adopted: List[dict]) -> str:
     return "".join(out)
 
 
+def _norm_with_raw_map(raw: str):
+    """规范化换行（\r\n -> \n、\r -> \n），并记录每个规范化字符的原文偏移。
+
+    返回 (规范化文本, to_raw)：to_raw[i] 为规范化第 i 个字符在原文中的起始
+    偏移（\r\n 整体规范化为 \n 时指向 \r），末尾附原文长度作哨兵，故规范化
+    区间 [a, b) 对应原文区间 [to_raw[a], to_raw[b])。
+    """
+    norm_chars = []
+    to_raw = []
+    i, n = 0, len(raw)
+    while i < n:
+        if raw[i] == "\r":
+            norm_chars.append("\n")
+            to_raw.append(i)
+            i += 2 if i + 1 < n and raw[i + 1] == "\n" else 1
+        else:
+            norm_chars.append(raw[i])
+            to_raw.append(i)
+            i += 1
+    to_raw.append(n)
+    return "".join(norm_chars), to_raw
+
+
+def _raw_srt_line_spans(raw: str):
+    """在原始 SRT 文本上复刻 parse_srt 的分块与空行过滤，定位各保留行的原文区间。
+
+    返回与 parse_srt 结果一一对应的列表：每块为 [(行起点, 行终点), ...]
+    （原文字符偏移，左闭右开，不含行尾换行符），行序与 parse_srt 保留的行
+    （序号行、时间行、正文行）一致。仅供导出在原文上定点替换：序号行、完整
+    时间行（含 X1/X2 等定位字段）、原有换行与块间空行全部原样保留。
+    """
+    norm, to_raw = _norm_with_raw_map(raw)
+    lo, hi = 0, len(norm)
+    while lo < hi and norm[lo] in EDGE_STRIP_CHARS:
+        lo += 1
+    while hi > lo and norm[hi - 1] in EDGE_STRIP_CHARS:
+        hi -= 1
+    spans = []
+    start = lo
+    for m in BLOCK_SEP_RE.finditer(norm, lo, hi):
+        spans.append((start, m.start()))
+        start = m.end()
+    spans.append((start, hi))
+    blocks = []
+    for a, b in spans:
+        while a < b and norm[a] == "\n":
+            a += 1
+        while b > a and norm[b - 1] == "\n":
+            b -= 1
+        lines = []
+        ls = a
+        for i in range(a, b):
+            if norm[i] == "\n":
+                if norm[ls:i].strip():
+                    lines.append((to_raw[ls], to_raw[i]))
+                ls = i + 1
+        if norm[ls:b].strip():
+            lines.append((to_raw[ls], to_raw[b]))
+        if lines:
+            blocks.append(lines)
+    return blocks
+
+
 def _term_prepare(req: "TermRequest"):
     """术语统一替换公共预处理：解析 SRT 与逐行术语并汇总别名，失败抛 400。"""
     try:
@@ -3063,17 +3128,61 @@ def terms_preview(req: TermRequest):
 
 @app.post("/api/terms/export")
 def terms_export(req: TermRequest):
+    """术语替换导出：在提交的原文上定点改写，不重新拼装字幕。
+
+    命中查找与采用规划同预览共用 _term_entry_result（同一套重叠命中选择
+    规则）；导出只把已采用命中所在的正文行片段替换为标准词：未改动块原样
+    保留，改动块保留原序号、完整时间行（含 X1/X2 等定位字段）、原有换行
+    与块间空行；无命中时下载内容与提交的 SRT 文本一致。
+    """
+    import bisect
+
     entries, _terms, aliases = _term_prepare(req)
-    blocks = []
-    for e in entries:
+    raw = req.srt
+    blocks = _raw_srt_line_spans(raw)
+    if len(blocks) != len(entries):  # 与 parse_srt 同一套分块逻辑，防御性校验
+        raise HTTPException(status_code=500, detail="内部错误：原文分块与解析结果不一致")
+
+    edits = []  # (原文起点, 原文终点, 替换后行文本)，按原文位置升序且互不重叠
+    for e, spans in zip(entries, blocks):
         r = _term_entry_result(e, aliases)
-        blocks.append(
-            f"{e['index']}\n{fmt_time(e['start'])} --> {fmt_time(e['end'])}\n"
-            + (r["revised"] if r["revised"] else "")
-        )
-    content = "\n\n".join(blocks) + "\n"
+        adopted = [h for h in r["hits"] if h["adopted"]]
+        if not adopted:
+            continue  # 未改动块：不触碰原文
+        body = e["lines"]
+        body_spans = spans[len(spans) - len(body):]  # 正文行 = 保留行末尾若干行
+        starts = []  # 各正文行在「换行连接文本」中的起始偏移（与命中位置同坐标系）
+        pos = 0
+        for ln in body:
+            starts.append(pos)
+            pos += len(ln) + 1
+        per_line = {}  # 正文行号 -> [(行内偏移, 命中长度, 标准词)]
+        for h in adopted:
+            k = bisect.bisect_right(starts, h["start"]) - 1
+            off = h["start"] - starts[k]
+            size = h["end"] - h["start"]
+            if k < 0 or off + size > len(body[k]):
+                continue  # 防御：别名不含换行，命中必完整落在某一行内
+            per_line.setdefault(k, []).append((off, size, h["std"]))
+        for k, repls in per_line.items():
+            rs, re_ = body_spans[k]
+            line = raw[rs:re_]  # 行内无 \r/\n，与解析行内容一致，偏移可直接对应
+            parts, p = [], 0
+            for off, size, std in sorted(repls):
+                parts.append(line[p:off])
+                parts.append(std)
+                p = off + size
+            parts.append(line[p:])
+            edits.append((rs, re_, "".join(parts)))
+
+    out, pos = [], 0
+    for rs, re_, text in edits:
+        out.append(raw[pos:rs])
+        out.append(text)
+        pos = re_
+    out.append(raw[pos:])
     return Response(
-        content=content.encode("utf-8"),
+        content="".join(out).encode("utf-8"),
         media_type="application/x-subrip",
         headers={"Content-Disposition": 'attachment; filename="terms_replaced.srt"'},
     )
